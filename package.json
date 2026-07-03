@@ -1,0 +1,32 @@
+{
+  "name": "nuum-connector",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "nuum": "dist/index.js",
+    "nuum-connector": "dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.10",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.7.0"
+  },
+  "repository": "github:sanity-labs/nuum-connector",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.21.0"
+  }
+}
