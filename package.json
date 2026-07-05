@@ -17,11 +17,14 @@
   ],
   "scripts": {
     "build": "tsc",
-    "prepare": "tsc"
+    "prepare": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "devDependencies": {
     "@types/node": "^20.17.10",
     "@types/ws": "^8.18.1",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.0"
   },
   "repository": "github:sanity-labs/nuum-connector",
