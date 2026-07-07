@@ -69,11 +69,9 @@ function parseDuration(raw: string): { ms: number; label: string } {
 // --- Running commands (multiplexed by commandId) ---
 
 const SIGKILL_DELAY = 5_000;
-const MAX_OUTPUT = 10 * 1024 * 1024; // 10MB per command
 
 interface RunningCommand {
   child: ChildProcess;
-  bytes: number;
   killed: boolean;
 }
 
@@ -105,23 +103,13 @@ function startCommand(
     cwd,
     env: env ? { ...process.env, ...env } : process.env,
   });
-  const entry: RunningCommand = { child, bytes: 0, killed: false };
+  const entry: RunningCommand = { child, killed: false };
   running.set(commandId, entry);
 
   safeSend(ws, { type: "started", commandId });
 
-  function killProc(reason: string): void {
-    if (entry.killed) return;
-    entry.killed = true;
-    safeSend(ws, { type: "stderr", commandId, data: Buffer.from(`\n[nuum-connector] ${reason}\n`).toString("base64") });
-    try { child.kill("SIGTERM"); } catch { /* gone */ }
-    setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* gone */ } }, SIGKILL_DELAY);
-  }
-
   function onChunk(stream: "stdout" | "stderr", data: Buffer): void {
-    entry.bytes += data.length;
     safeSend(ws, { type: stream, commandId, data: data.toString("base64") });
-    if (entry.bytes > MAX_OUTPUT && !entry.killed) killProc("Output exceeded 10MB limit");
   }
 
   child.stdout?.on("data", (d: Buffer) => onChunk("stdout", d));
