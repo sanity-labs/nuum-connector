@@ -54,7 +54,6 @@ function parseDuration(raw) {
 }
 // --- Running commands (multiplexed by commandId) ---
 const SIGKILL_DELAY = 5_000;
-const MAX_OUTPUT = 10 * 1024 * 1024; // 10MB per command
 const running = new Map();
 /** Safe send: no-op if socket is closed. */
 function safeSend(ws, frame) {
@@ -77,28 +76,11 @@ function startCommand(ws, commandId, cmd, cwd, env) {
         cwd,
         env: env ? { ...process.env, ...env } : process.env,
     });
-    const entry = { child, bytes: 0, killed: false };
+    const entry = { child, killed: false };
     running.set(commandId, entry);
     safeSend(ws, { type: "started", commandId });
-    function killProc(reason) {
-        if (entry.killed)
-            return;
-        entry.killed = true;
-        safeSend(ws, { type: "stderr", commandId, data: Buffer.from(`\n[nuum-connector] ${reason}\n`).toString("base64") });
-        try {
-            child.kill("SIGTERM");
-        }
-        catch { /* gone */ }
-        setTimeout(() => { try {
-            child.kill("SIGKILL");
-        }
-        catch { /* gone */ } }, SIGKILL_DELAY);
-    }
     function onChunk(stream, data) {
-        entry.bytes += data.length;
         safeSend(ws, { type: stream, commandId, data: data.toString("base64") });
-        if (entry.bytes > MAX_OUTPUT && !entry.killed)
-            killProc("Output exceeded 10MB limit");
     }
     child.stdout?.on("data", (d) => onChunk("stdout", d));
     child.stderr?.on("data", (d) => onChunk("stderr", d));
