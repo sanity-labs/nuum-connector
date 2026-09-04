@@ -5,6 +5,7 @@
  * WebSocket, allowing agents to execute commands on this machine.
  *
  * Usage: nuum <slug> --url <server-url> [--cwd /path]
+ *             [--auth otp --lease 8h [--max-lease 2d|indefinitely] --notify ntfy:<topic-or-url>]
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -15,6 +16,7 @@ import { spawn } from "node:child_process";
 import WebSocket from "ws";
 import { LeaseAuthority } from "./auth.js";
 import { parseNotifyConfig, createNtfyNotifier } from "./ntfy.js";
+import { formatLeaseDuration, isValidLeaseDurationMs, parseLeaseDuration, } from "./lease-duration.js";
 function configDir() {
     const dir = join(homedir(), ".nuum");
     if (!existsSync(dir))
@@ -40,17 +42,6 @@ function saveConfig(config) {
 }
 function generateKey() {
     return randomBytes(9).toString("base64url").slice(0, 12);
-}
-/** Parse a lease duration like "8h", "30m", "45s", "2d" into ms + a label. */
-function parseDuration(raw) {
-    const m = raw.trim().match(/^(\d+)\s*([smhd])$/i);
-    if (!m) {
-        throw new Error(`invalid --lease duration '${raw}' (use e.g. 8h, 30m, 45s, 2d)`);
-    }
-    const n = Number(m[1]);
-    const unit = m[2].toLowerCase();
-    const factor = unit === "s" ? 1000 : unit === "m" ? 60_000 : unit === "h" ? 3_600_000 : 86_400_000;
-    return { ms: n * factor, label: `${n}${unit}` };
 }
 // --- Running commands (multiplexed by commandId) ---
 const SIGKILL_DELAY = 5_000;
@@ -155,17 +146,25 @@ function reapAllCommands() {
  * the ntfy publish can complete before the result frame is sent. Errors are
  * reported to persona as an `error` frame, never left hanging.
  */
-async function handleRenew(ws, authority, commandId, spaceId, message) {
-    console.log(`[renew:${commandId}] space=${spaceId} reason=${JSON.stringify(message)}`);
+async function handleRenew(ws, authority, commandId, spaceId, message, requestedLeaseDurationMs) {
+    // Safe log: space, reason, and the exact requested duration (or "default" /
+    // "invalid" for a malformed wire value). Never the token/OTP.
+    const requestedLabel = requestedLeaseDurationMs === undefined
+        ? "default"
+        : isValidLeaseDurationMs(requestedLeaseDurationMs)
+            ? formatLeaseDuration(requestedLeaseDurationMs)
+            : "invalid";
+    console.log(`[renew:${commandId}] space=${spaceId} requested=${requestedLabel} reason=${JSON.stringify(message)}`);
     try {
-        const r = await authority.renew(spaceId, message);
+        const r = await authority.renew(spaceId, message, requestedLeaseDurationMs);
         if (r.ok) {
-            console.log(`[renew:${commandId}] pending created, notification sent`);
+            console.log(`[renew:${commandId}] pending created, lease=${formatLeaseDuration(r.leaseDurationMs)}, notification sent`);
             safeSend(ws, {
                 type: "renew_result",
                 commandId,
                 leaseToken: r.leaseToken,
                 pendingExpiresAt: r.pendingExpiresAt,
+                leaseDurationMs: r.leaseDurationMs,
             });
         }
         else {
@@ -181,8 +180,14 @@ async function handleRenew(ws, authority, commandId, spaceId, message) {
 function handleAuth(ws, authority, commandId, spaceId, leaseToken, otp) {
     const r = authority.verifyAuth(spaceId, leaseToken, otp);
     if (r.ok) {
-        console.log(`[auth:${commandId}] space=${spaceId} authorized`);
-        safeSend(ws, { type: "auth_result", commandId, leaseExpiresAt: r.leaseExpiresAt });
+        const until = r.leaseExpiresAt === null ? "never (until replaced or restart)" : new Date(r.leaseExpiresAt).toISOString();
+        console.log(`[auth:${commandId}] space=${spaceId} authorized lease=${formatLeaseDuration(r.leaseDurationMs)} expires=${until}`);
+        safeSend(ws, {
+            type: "auth_result",
+            commandId,
+            leaseExpiresAt: r.leaseExpiresAt,
+            leaseDurationMs: r.leaseDurationMs,
+        });
     }
     else {
         console.log(`[auth:${commandId}] space=${spaceId} failed: ${r.message}`);
@@ -257,7 +262,10 @@ function connect(config, cwd, authority) {
                     }
                     if (typeof frame.spaceId !== "string" || typeof frame.message !== "string")
                         return;
-                    void handleRenew(ws, authority, frame.commandId, frame.spaceId, frame.message);
+                    // `leaseDurationMs` is optional: undefined → daemon default. The
+                    // authority validates the raw value and answers with an explicit
+                    // error frame on anything malformed, so Persona never has to time out.
+                    void handleRenew(ws, authority, frame.commandId, frame.spaceId, frame.message, frame.leaseDurationMs);
                     return;
                 }
                 case "auth": {
@@ -331,22 +339,41 @@ function main() {
     let cwd = process.cwd();
     let authMode;
     let leaseArg = "8h";
+    let maxLeaseArg;
     let notifyArg;
+    // Every value-taking flag must be followed by its value. A flag with
+    // nothing after it, or with another recognized value-taking flag in its
+    // value position, is a malformed invocation, not an omission, so it fails
+    // closed here instead of being silently ignored (e.g. a trailing
+    // `--max-lease` must not quietly collapse to "max equals --lease", and
+    // `--notify --auth otp` must not swallow `--auth` and start unauthenticated).
+    const VALUE_FLAGS = ["--url", "--cwd", "--auth", "--lease", "--max-lease", "--notify"];
+    const valueAfter = (i) => {
+        const next = args[i + 1];
+        if (next === undefined || VALUE_FLAGS.includes(next)) {
+            console.error(`${args[i]} requires a value`);
+            process.exit(1);
+        }
+        return next;
+    };
     for (let i = 0; i < args.length; i++) {
-        if (args[i] === "--url" && i + 1 < args.length) {
-            url = args[++i];
+        if (args[i] === "--url") {
+            url = valueAfter(i++);
         }
-        else if (args[i] === "--cwd" && i + 1 < args.length) {
-            cwd = args[++i];
+        else if (args[i] === "--cwd") {
+            cwd = valueAfter(i++);
         }
-        else if (args[i] === "--auth" && i + 1 < args.length) {
-            authMode = args[++i];
+        else if (args[i] === "--auth") {
+            authMode = valueAfter(i++);
         }
-        else if (args[i] === "--lease" && i + 1 < args.length) {
-            leaseArg = args[++i];
+        else if (args[i] === "--lease") {
+            leaseArg = valueAfter(i++);
         }
-        else if (args[i] === "--notify" && i + 1 < args.length) {
-            notifyArg = args[++i];
+        else if (args[i] === "--max-lease") {
+            maxLeaseArg = valueAfter(i++);
+        }
+        else if (args[i] === "--notify") {
+            notifyArg = valueAfter(i++);
         }
         else if (!args[i].startsWith("-") && !slug) {
             slug = args[i];
@@ -358,14 +385,20 @@ function main() {
     }
     if (!slug) {
         console.log("Usage: nuum <slug> --url <server-url> [--cwd /path]");
-        console.log("            [--auth otp --lease 8h --notify ntfy:<topic-or-url>]");
+        console.log("            [--auth otp --lease 8h [--max-lease <duration|indefinitely>]");
+        console.log("             --notify ntfy:<topic-or-url>]");
         console.log("");
         console.log("  slug      Local name for this connector (e.g. 'laptop', 'build-server')");
         console.log("  --url     Nuum/Persona server URL (e.g. https://persona.example.com)");
         console.log("  --cwd     Working directory for command execution (default: current dir)");
         console.log("  --auth    Enable opt-in lease-token auth ('otp'). Off by default.");
-        console.log("  --lease   Lease duration when auth is on (default 8h).");
+        console.log("  --lease   Default lease duration when a request omits one (default 8h; finite).");
+        console.log("  --max-lease");
+        console.log("            Longest lease an agent may request: a duration or 'indefinitely'.");
+        console.log("            Defaults to --lease. Longer requests are rejected, never clamped.");
         console.log("  --notify  OTP carrier when auth is on, e.g. ntfy:<topic-or-url>.");
+        console.log("");
+        console.log("  Durations: <n>s, <n>m, <n>h, <n>d (e.g. 30m, 2h, 8h, 2d).");
         process.exit(1);
     }
     // Build the opt-in auth layer. Auth is OFF unless --auth is set; when on, a
@@ -376,9 +409,22 @@ function main() {
             console.error(`Unsupported --auth mode '${authMode}'. Only 'otp' is supported.`);
             process.exit(1);
         }
-        let lease;
+        // Lease policy: --lease is the finite default for requests that omit a
+        // duration; --max-lease is the ceiling (may be 'indefinitely') and defaults
+        // to --lease so an unconfigured daemon keeps today's fixed upper bound.
+        // Any invalid or inconsistent policy fails startup (fail closed): grammar
+        // and safe-integer overflow here, then the authority's constructor checks
+        // that both values can produce a valid expiry date from this clock.
+        let defaultLeaseMs;
+        let maxLeaseMs;
         try {
-            lease = parseDuration(leaseArg);
+            const parsedDefault = parseLeaseDuration(leaseArg, { flag: "--lease", allowIndefinite: false });
+            // parseLeaseDuration only returns null when indefinite is allowed.
+            defaultLeaseMs = parsedDefault;
+            maxLeaseMs =
+                maxLeaseArg === undefined
+                    ? defaultLeaseMs
+                    : parseLeaseDuration(maxLeaseArg, { flag: "--max-lease", allowIndefinite: true });
         }
         catch (e) {
             console.error(e.message);
@@ -389,11 +435,11 @@ function main() {
             authority = new LeaseAuthority({
                 connector: slug,
                 host: hostname(),
-                leaseMs: lease.ms,
-                leaseLabel: lease.label,
+                defaultLeaseMs,
+                maxLeaseMs,
                 notify: createNtfyNotifier(ntfy),
             });
-            console.log(`Auth: ENABLED (otp), lease ${lease.label}, notify ${ntfy.url}`);
+            console.log(`Auth: ENABLED (otp), lease ${authority.describePolicy()}, notify ${ntfy.url}`);
         }
         catch (e) {
             console.error(`Auth enabled but misconfigured: ${e.message}`);

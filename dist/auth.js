@@ -7,17 +7,32 @@
  * real notification carrier:
  *
  *   - `authorizeStart` gates `exec` on an active, unexpired lease for a space.
- *   - `renew` mints a >=256-bit lease token, stores only its hash as a pending
- *     renewal, generates an OTP, and asks the injected notifier to deliver it.
- *   - `verifyAuth` checks the hidden token + OTP and promotes pending → active.
+ *   - `renew` resolves + enforces the requested lease duration against this
+ *     daemon's policy, mints a >=256-bit lease token, stores only its hash as
+ *     a pending renewal bound to that exact duration, generates an OTP, and
+ *     asks the injected notifier to deliver it (showing the same duration).
+ *   - `verifyAuth` checks the hidden token + OTP and promotes pending → active,
+ *     starting the lease clock (or installing an indefinite lease) using the
+ *     duration bound at renew time.
  *
  * Security properties (mirrors the design doc):
- *   - Only token/OTP HASHES are held, in memory. Restart clears everything.
+ *   - Only token/OTP HASHES are held, in memory. Restart clears everything —
+ *     including indefinite leases.
  *   - OTP alone is useless (needs the matching hidden token) and vice-versa.
  *   - Newest renewal for a space replaces the prior pending one.
+ *   - Successful auth installs ONE active lease per space, replacing any prior
+ *     active lease for that space.
  *   - Wrong OTP (or wrong hidden token) burns an attempt; the limit blocks it.
+ *   - The daemon is the policy authority: a request above `--max-lease` is
+ *     rejected before any state changes or notification. It is never clamped,
+ *     because the human approves the exact duration shown in the notification.
+ *   - A finite duration is accepted only if a successful auth at ANY instant
+ *     inside the pending approval window would yield an expiry that is a valid
+ *     epoch-ms `Date`. This is re-checked on every renew with the daemon's own
+ *     clock, so a long-running daemon never relies on startup-time validation.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { formatLeaseDuration, isValidLeaseDurationMs, leaseExpiryAt, validateLeasePolicy, } from "./lease-duration.js";
 // Crockford base32, minus the ambiguous I L O U — read-aloud friendly.
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const DEFAULT_LEASE_MS = 8 * 60 * 60 * 1000;
@@ -61,45 +76,105 @@ export function normalizeOtp(raw) {
 export class LeaseAuthority {
     cfg;
     pending = new Map(); // by spaceId
-    active = new Map(); // by tokenHash
+    active = new Map(); // by spaceId
     lastRenewAt = new Map(); // by spaceId
     constructor(config) {
+        const defaultLeaseMs = config.defaultLeaseMs ?? DEFAULT_LEASE_MS;
+        // Omitted maximum → equals the default: exactly today's fixed upper bound.
+        const maxLeaseMs = config.maxLeaseMs === undefined ? defaultLeaseMs : config.maxLeaseMs;
+        const pendingMs = config.pendingMs ?? DEFAULT_PENDING_MS;
+        const now = config.now ?? Date.now;
+        // Fail closed at startup: the default (and a finite max) must be able to
+        // produce a valid expiry for a renew issued now and approved at the very
+        // end of its pending window. Renew re-checks this against the live clock.
+        validateLeasePolicy({ defaultMs: defaultLeaseMs, maxMs: maxLeaseMs }, now() + pendingMs);
         this.cfg = {
             connector: config.connector,
             host: config.host,
-            leaseMs: config.leaseMs ?? DEFAULT_LEASE_MS,
-            leaseLabel: config.leaseLabel ?? "8h",
-            pendingMs: config.pendingMs ?? DEFAULT_PENDING_MS,
+            defaultLeaseMs,
+            maxLeaseMs,
+            pendingMs,
             maxAttempts: config.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
             renewCooldownMs: config.renewCooldownMs ?? DEFAULT_RENEW_COOLDOWN_MS,
             notify: config.notify,
-            now: config.now ?? Date.now,
+            now,
             mintToken: config.mintToken ?? defaultMintToken,
             mintOtp: config.mintOtp ?? defaultMintOtp,
         };
+    }
+    /** Human-readable policy summary for startup logs (no secrets). */
+    describePolicy() {
+        return `default ${formatLeaseDuration(this.cfg.defaultLeaseMs)}, max ${formatLeaseDuration(this.cfg.maxLeaseMs)}`;
     }
     /** Decide whether an exec `start` may run for this space + hidden token. */
     authorizeStart(spaceId, leaseToken) {
         if (!leaseToken) {
             return { ok: false, code: "auth_required", message: "no lease token" };
         }
-        const tokenHash = sha256(leaseToken);
-        const lease = this.active.get(tokenHash);
-        if (!lease || lease.spaceId !== spaceId) {
+        const lease = this.active.get(spaceId);
+        if (!lease || lease.spaceId !== spaceId || !hashesEqual(sha256(leaseToken), lease.tokenHash)) {
             return { ok: false, code: "auth_required", message: "no active lease" };
         }
-        if (this.cfg.now() >= lease.leaseExpiresAt) {
-            this.active.delete(tokenHash);
+        if (lease.leaseExpiresAt !== null && this.cfg.now() >= lease.leaseExpiresAt) {
+            this.active.delete(spaceId);
             return { ok: false, code: "auth_required", message: "lease expired" };
         }
         return { ok: true };
     }
     /**
-     * Create (or replace) a pending renewal for a space: mint a lease token +
-     * OTP, store hashes, notify the human, return the raw token to persona.
+     * Resolve the requested duration against policy at daemon time `now`.
+     * `undefined` (field omitted) → the finite default. Anything that is not
+     * `null` or a valid finite value is invalid. A finite value (default
+     * included) is also invalid when a successful auth at any instant inside
+     * the pending window — latest `now + pendingMs` — could not produce an
+     * expiry that is a valid epoch-ms `Date`; expiry grows with the auth
+     * instant, so checking the latest one covers the whole window. A valid
+     * value above the maximum is rejected, never clamped.
      */
-    async renew(spaceId, message) {
+    resolveLeaseDuration(requested, now) {
+        const value = requested === undefined ? this.cfg.defaultLeaseMs : requested;
+        if (!isValidLeaseDurationMs(value)) {
+            return {
+                ok: false,
+                code: "invalid_lease_duration",
+                message: "invalid lease duration: expected positive integer milliseconds or null (indefinitely)",
+            };
+        }
+        if (value !== null && leaseExpiryAt(now + this.cfg.pendingMs, value) === null) {
+            return {
+                ok: false,
+                code: "invalid_lease_duration",
+                message: `invalid lease duration: ${formatLeaseDuration(value)} cannot produce a valid expiry date ` +
+                    `from this connector's clock; request a shorter lease`,
+            };
+        }
+        const max = this.cfg.maxLeaseMs;
+        if (max !== null && (value === null || value > max)) {
+            return {
+                ok: false,
+                code: "lease_duration_exceeds_max",
+                message: `requested lease ${formatLeaseDuration(value)} exceeds this connector's maximum ` +
+                    `${formatLeaseDuration(max)}; request a shorter lease`,
+            };
+        }
+        return { ok: true, leaseDurationMs: value };
+    }
+    /**
+     * Create (or replace) a pending renewal for a space: resolve + enforce the
+     * requested duration, mint a lease token + OTP, store hashes bound to that
+     * duration, notify the human (showing it), return the raw token to persona.
+     *
+     * `requestedLeaseDurationMs` is the raw wire value: omitted (`undefined`)
+     * means the daemon default; `null` means indefinitely; a positive
+     * safe-integer means that many milliseconds. It is validated here.
+     */
+    async renew(spaceId, message, requestedLeaseDurationMs) {
         const now = this.cfg.now();
+        // Policy first: a rejected request must leave pending/active/cooldown state untouched.
+        const resolved = this.resolveLeaseDuration(requestedLeaseDurationMs, now);
+        if (!resolved.ok)
+            return resolved;
+        const leaseDurationMs = resolved.leaseDurationMs;
         const last = this.lastRenewAt.get(spaceId);
         if (last !== undefined && now - last < this.cfg.renewCooldownMs) {
             return {
@@ -116,6 +191,7 @@ export class LeaseAuthority {
             spaceId,
             otpHash: sha256(normalizeOtp(otp)),
             message,
+            leaseDurationMs,
             pendingExpiresAt,
             attempts: 0,
         };
@@ -126,7 +202,8 @@ export class LeaseAuthority {
                 connector: this.cfg.connector,
                 host: this.cfg.host,
                 spaceId,
-                leaseLabel: this.cfg.leaseLabel,
+                leaseDurationMs,
+                leaseLabel: formatLeaseDuration(leaseDurationMs),
                 reason: message,
                 otp,
                 pendingExpiresAt,
@@ -143,15 +220,25 @@ export class LeaseAuthority {
             };
         }
         this.lastRenewAt.set(spaceId, now);
-        return { ok: true, leaseToken, pendingExpiresAt };
+        return { ok: true, leaseToken, pendingExpiresAt, leaseDurationMs };
     }
-    /** Verify hidden token + OTP; on success promote pending → active lease. */
+    /**
+     * Verify hidden token + OTP; on success promote pending → active lease using
+     * the duration bound at renew time. The lease clock starts NOW (successful
+     * auth), not at renew. The new lease replaces any prior active lease for
+     * this space.
+     */
     verifyAuth(spaceId, leaseToken, otp) {
         const pending = this.pending.get(spaceId);
         if (!pending) {
             return { ok: false, code: "auth_failed", message: "no pending renewal" };
         }
-        if (this.cfg.now() >= pending.pendingExpiresAt) {
+        // ONE clock reading decides both whether the OTP is still inside the
+        // pending window and, on success, where the active lease clock starts. A
+        // second reading could land past the window boundary that renew's
+        // representability check relied on.
+        const now = this.cfg.now();
+        if (now >= pending.pendingExpiresAt) {
             this.pending.delete(spaceId);
             return { ok: false, code: "auth_failed", message: "pending renewal expired" };
         }
@@ -169,14 +256,30 @@ export class LeaseAuthority {
             }
             return { ok: false, code: "auth_failed", message: "invalid token or code" };
         }
+        // The matched token + OTP are single-use: consumed here whatever follows.
         this.pending.delete(spaceId);
-        const leaseExpiresAt = this.cfg.now() + this.cfg.leaseMs;
-        this.active.set(pending.tokenHash, {
+        const leaseDurationMs = pending.leaseDurationMs;
+        // Representable by construction: renew accepted this duration only if an
+        // auth at the END of the pending window yields a valid Date, and `now` is
+        // strictly inside that window (checked above). Still derive the expiry
+        // through the same guard rather than trusting the addition, and fail
+        // closed — no active lease, no success — if it ever comes back null.
+        const leaseExpiresAt = leaseDurationMs === null ? null : leaseExpiryAt(now, leaseDurationMs);
+        if (leaseDurationMs !== null && leaseExpiresAt === null) {
+            return {
+                ok: false,
+                code: "auth_failed",
+                message: `lease ${formatLeaseDuration(leaseDurationMs)} cannot produce a valid expiry date ` +
+                    `from this connector's clock; renew again`,
+            };
+        }
+        this.active.set(spaceId, {
             tokenHash: pending.tokenHash,
             spaceId,
+            leaseDurationMs,
             leaseExpiresAt,
         });
-        return { ok: true, leaseExpiresAt };
+        return { ok: true, leaseExpiresAt, leaseDurationMs };
     }
     // --- introspection (tests / audit) ---
     hasPending(spaceId) {
