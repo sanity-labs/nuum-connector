@@ -11,7 +11,8 @@
  * as a Bearer token for access-controlled ntfy servers.
  *
  * Publish is a plain HTTP POST: the message body is the human-readable request,
- * with the OTP on its own line so it is easy to read aloud / type into chat.
+ * with the OTP on its own line so it is easy to read aloud / type into chat,
+ * and the exact lease duration the code approves.
  */
 
 import type { NotificationPayload, Notifier } from "./auth.js";
@@ -44,8 +45,18 @@ export function parseNotifyConfig(raw: string | undefined): NtfyConfig {
   return { url: `https://ntfy.sh/${value}` };
 }
 
-function formatBody(p: NotificationPayload): string {
-  const expiresMin = Math.max(1, Math.round((p.pendingExpiresAt - Date.now()) / 60000));
+/**
+ * The message body the human approves against. `Lease:` is the EXACT duration
+ * bound to this pending approval (resolved by the daemon at renew time), so
+ * approving the code approves that duration and nothing else. `Expires:` is
+ * the independent OTP window, not the lease.
+ */
+export function formatNotificationBody(p: NotificationPayload, now: number = Date.now()): string {
+  const expiresMin = Math.max(1, Math.round((p.pendingExpiresAt - now) / 60000));
+  const lease =
+    p.leaseDurationMs === null
+      ? `${p.leaseLabel} (no expiry; lasts until replaced or the connector restarts)`
+      : p.leaseLabel;
   return [
     "Persona requests connector access",
     "",
@@ -53,11 +64,11 @@ function formatBody(p: NotificationPayload): string {
     `Host: ${p.host}`,
     `Space: ${p.spaceId}`,
     `Access: shell exec`,
-    `Lease: ${p.leaseLabel}`,
+    `Lease: ${lease}`,
     `Reason: ${p.reason}`,
     "",
     `Code: ${p.otp}`,
-    `Expires: ${expiresMin} minutes`,
+    `Code expires: ${expiresMin} minutes`,
   ].join("\n");
 }
 
@@ -76,7 +87,7 @@ export function createNtfyNotifier(config: NtfyConfig): Notifier {
     const res = await fetch(config.url, {
       method: "POST",
       headers,
-      body: formatBody(payload),
+      body: formatNotificationBody(payload),
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
