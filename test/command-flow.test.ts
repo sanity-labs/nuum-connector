@@ -140,3 +140,30 @@ test("child exit with all output still uncredited cannot make Node flush/drop it
     assert.deepEqual(Buffer.concat(output), Buffer.alloc(111, 251));
   } finally { flow.dispose(); child.kill("SIGKILL"); }
 });
+
+test("stdin closure drains already-granted input without failing or re-crediting", async () => {
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const stdin = new PassThrough({ highWaterMark: 1 });
+  const frames: Array<{ type: "stdout" | "stderr"; data: string } | { type: "stdin_credit"; bytes: number }> = [];
+  const failures: Error[] = [];
+  const flow = new CommandFlow(stdout, stderr, stdin, frame => frames.push(frame), error => failures.push(error));
+
+  flow.start();
+  const payload = Buffer.alloc(F, 7).toString("base64");
+  flow.writeInput(payload);
+  stdin.destroy(new Error("Cannot call write after a stream was destroyed"));
+  await delay(20);
+
+  // Already-granted frames may still be in flight from the provider. Once the
+  // child closes stdin, consume that remaining ledger without failing the whole
+  // command and without issuing fresh credit.
+  flow.writeInput(payload);
+  flow.writeInput(payload);
+  flow.writeInput(payload);
+  await delay(20);
+
+  assert.deepEqual(failures, []);
+  assert.equal(frames.filter(frame => frame.type === "stdin_credit").length, 1);
+  flow.dispose();
+});

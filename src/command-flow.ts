@@ -10,6 +10,7 @@ export class CommandFlow {
   private inputCredit = TRANSFER_WINDOW_BYTES;
   private inputAck = 0;
   private inputClosed = false;
+  private inputSinkClosed = false;
   private disposed = false;
   private pumping = false;
   private nextStream = 0;
@@ -27,7 +28,7 @@ export class CommandFlow {
       stream.on("readable", this.pumpOutput);
       stream.on("error", this.onError);
     }
-    stdin.on("error", this.onError);
+    stdin.on("error", this.onInputClosed);
     stdin.on("drain", this.flushInputAck);
   }
 
@@ -73,22 +74,34 @@ export class CommandFlow {
 
   writeInput(data: unknown): void {
     if (this.disposed) return;
+    let bytes: number;
     try {
-      const bytes = transferDataSize(data);
+      bytes = transferDataSize(data);
       if (this.inputClosed || bytes > this.inputCredit) throw new Error("stdin exceeded transfer credit or followed EOF");
       this.inputCredit -= bytes;
+    } catch (e) {
+      this.onError(e as Error);
+      return;
+    }
+
+    if (this.inputSinkClosed) return;
+
+    try {
       this.stdin.write(Buffer.from(data as string, "base64"), (error?: Error | null) => {
         if (this.disposed) return;
-        if (error) { this.onError(error); return; }
+        if (error) { this.onInputClosed(error); return; }
+        if (this.inputSinkClosed) return;
         this.inputAck += bytes;
         this.flushInputAck();
       });
-    } catch (e) { this.onError(e as Error); }
+    } catch (e) {
+      this.onInputClosed(e as Error);
+    }
   }
 
   private readonly flushInputAck = (): void => {
     // A write callback alone is insufficient when Node still needs drain.
-    if (this.disposed || this.inputClosed || this.stdin.writableNeedDrain || this.inputAck === 0) return;
+    if (this.disposed || this.inputClosed || this.inputSinkClosed || this.stdin.writableNeedDrain || this.inputAck === 0) return;
     const bytes = this.inputAck;
     this.inputAck = 0;
     this.inputCredit = addCredit(this.inputCredit, bytes);
@@ -98,8 +111,23 @@ export class CommandFlow {
   closeInput(): void {
     if (this.disposed || this.inputClosed) return;
     this.inputClosed = true;
-    this.stdin.end(); // Node flushes the bounded pending writes before EOF.
+    if (this.inputSinkClosed) return;
+    try {
+      this.stdin.end(); // Node flushes the bounded pending writes before EOF.
+    } catch (e) {
+      this.onInputClosed(e as Error);
+    }
   }
+
+  private readonly onInputClosed = (_error?: Error): void => {
+    // Child processes are allowed to exit or close stdin before consuming all
+    // credited input (for example upload destination-exists checks). Treat the
+    // stdin pipe closure as backpressure terminal state, not as a transfer
+    // protocol failure that would race and mask the child's honest exit code.
+    if (this.disposed) return;
+    this.inputSinkClosed = true;
+    this.inputAck = 0;
+  };
 
   private readonly onError = (error: Error): void => {
     if (!this.disposed) this.fail(error);

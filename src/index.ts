@@ -70,6 +70,7 @@ const SIGKILL_DELAY = 5_000;
 interface RunningCommand {
   child: ChildProcess;
   killed: boolean;
+  killTimer?: ReturnType<typeof setTimeout>;
   flow?: CommandFlow;
   cancelFlow?: () => void;
   failFlow?: (error: Error) => void;
@@ -118,6 +119,10 @@ function startCommand(
     if (terminal) return;
     terminal = true;
     running.delete(commandId);
+    if (entry.killTimer) {
+      clearTimeout(entry.killTimer);
+      entry.killTimer = undefined;
+    }
     entry.flow?.dispose();
     safeSend(ws, frame);
   };
@@ -165,6 +170,7 @@ function terminateCommand(entry: RunningCommand, signal: NodeJS.Signals): void {
   if (entry.killed) return;
   entry.killed = true;
   const kill = (sig: NodeJS.Signals): void => {
+    if (entry.child.exitCode !== null || entry.child.signalCode !== null) return;
     try {
       if (entry.flow && entry.child.pid) process.kill(-entry.child.pid, sig);
       else entry.child.kill(sig);
@@ -172,7 +178,11 @@ function terminateCommand(entry: RunningCommand, signal: NodeJS.Signals): void {
   };
   kill(signal);
   entry.flow?.dispose();
-  setTimeout(() => kill("SIGKILL"), SIGKILL_DELAY).unref();
+  entry.killTimer = setTimeout(() => {
+    entry.killTimer = undefined;
+    kill("SIGKILL");
+  }, SIGKILL_DELAY);
+  entry.killTimer.unref();
 }
 
 function cancelCommand(commandId: string): void {

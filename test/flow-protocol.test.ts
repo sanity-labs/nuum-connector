@@ -89,3 +89,45 @@ test("daemon negotiation, bounded duplex frames, independent peer/control and ca
     rmSync(scratch, { recursive: true, force: true });
   }
 });
+
+
+test("daemon preserves child exit when bounded stdin closes before granted input drains", { timeout: 15000 }, async () => {
+  const scratch = mkdtempSync(join(tmpdir(), "nuum-flow-"));
+  const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+  await once(wss, "listening");
+  const address = wss.address(); assert.ok(address && typeof address === "object");
+  const connected = once(wss, "connection");
+  const entrypoint = process.env.CONNECTOR_TEST_DIST === "1" ? ["dist/index.js"] : ["--import", "tsx", "src/index.ts"];
+  const daemon = spawn(process.execPath, [...entrypoint, "flow-test", "--url", `http://127.0.0.1:${address.port}`], {
+    env: { ...process.env, HOME: scratch }, stdio: "ignore",
+  });
+  const [ws] = await connected;
+  const frames: Array<any> = [];
+  ws.on("message", raw => frames.push(JSON.parse(raw.toString())));
+  const send = (frame: unknown) => ws.send(JSON.stringify(frame));
+  const forId = (id: string, type: string) => frames.filter(f => f.commandId === id && f.type === type);
+  try {
+    await until(() => frames.some(f => f.type === "ready"));
+    send({
+      type: "start",
+      commandId: "early-close",
+      cmd: ["exec 0<&-; echo destination exists >&2; sleep 0.05; exit 4"],
+      flowControl: BOUNDED_TRANSFER,
+    });
+    await until(() => forId("early-close", "stdin_credit").length > 0);
+    send({ type: "output_credit", commandId: "early-close", bytes: W });
+    const payload = Buffer.alloc(F, 9);
+    for (let i = 0; i < 4; i += 1) {
+      send({ type: "stdin", commandId: "early-close", data: payload.toString("base64") });
+    }
+
+    await until(() => forId("early-close", "exit").length === 1);
+    assert.equal(forId("early-close", "exit")[0].code, 4);
+    assert.equal(forId("early-close", "error").length, 0);
+    assert.match(Buffer.concat(forId("early-close", "stderr").map(f => Buffer.from(f.data, "base64"))).toString(), /destination exists/);
+  } finally {
+    ws.terminate(); daemon.kill("SIGTERM"); await once(daemon, "close");
+    await new Promise<void>(resolve => wss.close(() => resolve()));
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});

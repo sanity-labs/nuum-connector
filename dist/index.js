@@ -83,6 +83,10 @@ function startCommand(ws, commandId, cmd, cwd, env, flowControl) {
             return;
         terminal = true;
         running.delete(commandId);
+        if (entry.killTimer) {
+            clearTimeout(entry.killTimer);
+            entry.killTimer = undefined;
+        }
         entry.flow?.dispose();
         safeSend(ws, frame);
     };
@@ -143,6 +147,8 @@ function terminateCommand(entry, signal) {
         return;
     entry.killed = true;
     const kill = (sig) => {
+        if (entry.child.exitCode !== null || entry.child.signalCode !== null)
+            return;
         try {
             if (entry.flow && entry.child.pid)
                 process.kill(-entry.child.pid, sig);
@@ -153,7 +159,11 @@ function terminateCommand(entry, signal) {
     };
     kill(signal);
     entry.flow?.dispose();
-    setTimeout(() => kill("SIGKILL"), SIGKILL_DELAY).unref();
+    entry.killTimer = setTimeout(() => {
+        entry.killTimer = undefined;
+        kill("SIGKILL");
+    }, SIGKILL_DELAY);
+    entry.killTimer.unref();
 }
 function cancelCommand(commandId) {
     const entry = running.get(commandId);
