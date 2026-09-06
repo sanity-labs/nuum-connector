@@ -4,7 +4,7 @@ export const TRANSFER_FRAME_BYTES = 16 * 1024;
 export const TRANSFER_WINDOW_BYTES = 64 * 1024;
 export const TRANSFER_WIRE_BYTES = 64 * 1024;
 export const TRANSFER_UPGRADE_REQUIRED =
-  "connector cp requires bounded transfer support; upgrade the public nuum-connector daemon and Persona connector provider";
+  "connector exec/cp requires byte-credit-v1 flow control; upgrade the public nuum-connector daemon and Persona connector provider/client";
 
 /** Credits count decoded bytes, shared by stdout and stderr for each command. */
 export function addCredit(current: number, bytes: unknown): number {

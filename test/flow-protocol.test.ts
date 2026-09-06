@@ -79,6 +79,54 @@ test("daemon negotiation, bounded duplex frames, independent peer/control and ca
     await until(() => forId("upload", "exit").length === 1);
     assert.equal(forId("upload", "exit")[0].code, 0);
     assert.deepEqual(readFileSync(join(scratch, "uploaded.bin")), data);
+    // Generic commands use the identical byte plane, including stderr and stdin.
+    start("generic", "cat; printf diagnostic >&2; exit 7");
+    await until(() => forId("generic", "stdin_credit").length > 0);
+    send({ type: "output_credit", commandId: "generic", bytes: W });
+    send({ type: "stdin", commandId: "generic", data: Buffer.from("generic input\n").toString("base64") });
+    send({ type: "stdin_close", commandId: "generic" });
+    await until(() => forId("generic", "exit").length === 1);
+    assert.equal(forId("generic", "exit")[0].code, 7);
+    assert.equal(Buffer.concat(forId("generic", "stdout").map(f => Buffer.from(f.data, "base64"))).toString(), "generic input\n");
+    assert.equal(Buffer.concat(forId("generic", "stderr").map(f => Buffer.from(f.data, "base64"))).toString(), "diagnostic");
+    // An old Persona/provider may still use this daemon's legacy start. New
+    // Persona enforces negotiation; daemon lease/control access needs none.
+    send({ type: "start", commandId: "legacy", cmd: ["printf legacy"] });
+    send({ type: "renew", commandId: "renew", spaceId: "inert", message: "test" });
+    send({ type: "auth", commandId: "auth", spaceId: "inert", leaseToken: "inert", otp: "inert" });
+    await until(() => forId("legacy", "exit").length === 1 && forId("auth", "error").length === 1 && forId("renew", "error").length === 1);
+    assert.equal(forId("legacy", "started")[0].flowControl, undefined);
+    assert.equal(Buffer.concat(forId("legacy", "stdout").map(f => Buffer.from(f.data, "base64"))).toString(), "legacy");
+    assert.equal(forId("renew", "error")[0].code, "auth_disabled");
+    assert.equal(forId("auth", "error")[0].code, "auth_disabled");
+
+    // Cancellation's terminal error is not a process-exit acknowledgement.
+    // A noisy child ignoring SIGINT must still be killed by the guarded timer.
+    const stubbornScript = join(scratch, "stubborn.cjs");
+    const stubbornPidFile = join(scratch, "stubborn.pid");
+    writeFileSync(stubbornScript, `
+      process.on("SIGINT", () => {});
+      process.stdout.on("error", () => {});
+      require("node:fs").writeFileSync(${JSON.stringify(stubbornPidFile)}, String(process.pid));
+      process.stdout.write(Buffer.alloc(${W * 3}, 97));
+      setInterval(() => {}, 1000);
+    `);
+    start("stubborn", `exec '${process.execPath}' '${stubbornScript}'`);
+    await until(() => existsSync(stubbornPidFile));
+    const stubbornPid = Number(readFileSync(stubbornPidFile, "utf8"));
+    const alive = () => { try { process.kill(stubbornPid, 0); return true; } catch { return false; } };
+    try {
+      send({ type: "output_credit", commandId: "stubborn", bytes: W });
+      await until(() => bytes("stubborn") === W);
+      send({ type: "cancel", commandId: "stubborn" });
+      await until(() => forId("stubborn", "error").length === 1);
+      assert.equal(forId("stubborn", "error")[0].code, "cancelled");
+      assert.equal(alive(), true, "cancelled frame must not be mistaken for confirmed termination");
+      for (let i = 0; i < 1400 && alive(); i++) await delay(5);
+      assert.equal(alive(), false, "SIGKILL escalation must survive terminal cancellation reporting");
+      assert.equal(forId("stubborn", "exit").length, 0);
+      assert.equal(forId("stubborn", "error").length, 1);
+    } finally { if (alive()) process.kill(stubbornPid, "SIGKILL"); }
     // Unknown requested versions fail before executing even a marker-file command.
     send({ type: "start", commandId: "bad-version", cmd: [`touch '${join(scratch, "must-not-exist")}'`], flowControl: "unknown-v2" });
     await until(() => forId("bad-version", "error").length === 1);

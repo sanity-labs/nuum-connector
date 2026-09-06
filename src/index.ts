@@ -115,14 +115,17 @@ function startCommand(
   running.set(commandId, entry);
 
   let terminal = false;
+  const clearKillTimer = (): void => {
+    if (entry.killTimer) clearTimeout(entry.killTimer);
+    entry.killTimer = undefined;
+  };
   const finish = (frame: UplinkResultFrame): void => {
     if (terminal) return;
     terminal = true;
     running.delete(commandId);
-    if (entry.killTimer) {
-      clearTimeout(entry.killTimer);
-      entry.killTimer = undefined;
-    }
+    // A terminal error acknowledges cancellation, not process exit. Keep the
+    // guarded escalation alive until the child actually terminates.
+    if (child.exitCode !== null || child.signalCode !== null) clearKillTimer();
     entry.flow?.dispose();
     safeSend(ws, frame);
   };
@@ -147,7 +150,10 @@ function startCommand(
     child.stderr?.on("data", (data: Buffer) => safeSend(ws, { type: "stderr", commandId, data: data.toString("base64") }));
   }
   // close waits for the output pipes to finish: exit never overtakes file bytes.
-  child.on("close", (code: number | null) => finish({ type: "exit", commandId, code: code ?? 1 }));
+  child.on("close", (code: number | null) => {
+    clearKillTimer();
+    finish({ type: "exit", commandId, code: code ?? 1 });
+  });
   child.on("error", (err: Error) => finish({ type: "error", commandId, code: "spawn_error", message: err.message }));
 }
 
