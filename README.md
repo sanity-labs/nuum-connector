@@ -398,3 +398,57 @@ Start the connector with an explicit working directory:
 - There is no command sandboxing in this version.
 
 Use a dedicated low-privilege OS user when possible.
+
+## Bounded Persona exec and file transfers
+
+This daemon advertises `byte-credit-v1` for all new Persona `connector exec` and
+`connector cp` starts. New Persona client/provider requires per-command
+negotiation and rejects old public or historical in-repo daemons before launch,
+with upgrade guidance. Status/list/renew/auth access remains available; existing
+sessions are not terminated solely for missing capability. An old client also
+needs updating to start commands through a new provider. This daemon still
+accepts legacy starts from old Persona/provider combinations, without a bounded
+output guarantee. There is no automatic daemon upgrade.
+
+The protocol uses per-command byte credit in both directions: 16 KiB maximum
+decoded data frames, 64 KiB outstanding bytes per direction, and 64 KiB maximum
+serialized frames. Stdout/stderr share output credit; child pipes are read only
+within credit. Persona returns credit after consumer progress. Stdin credit is
+returned after child writes complete and drain is honored, including generic
+exec stdin. The provider relays by command ID without pausing the shared uplink.
+Exit/error/cancel frames need no data credit. Successful exit follows all output.
+Cancellation destroys paused streams and signals the command's process group.
+The terminal `cancelled` error acknowledges cancellation, not process exit; the
+SIGKILL timer remains active until the tracked child actually closes or exits,
+with a five-second delay and an exit/signal guard against recycled PID signalling.
+Node/kernel stream buffers and base64/JSON copies add finite allowances. Bounds
+are per command; concurrent sessions have no new aggregate admission limit.
+
+New Persona's buffered generic exec keeps exact small stdout/stderr strings and
+limits decoded text to 1 MiB UTF-8 bytes independently per stream. Overflow or
+capture sink failure is an explicit capture error with no partial data result;
+Persona closes/cancels the session and reports any already observed remote exit
+separately. A cancellation request alone does not confirm remote termination.
+Side effects may already have happened: do not automatically rerun. The client
+retains failure evidence through its current call/result lifetime, with no new
+connector reconnectability or durable output store.
+
+For exact large output, redirect on the remote machine before execution, then
+retrieve via bounded cp (local redirection of buffered exec still hits the cap):
+
+```sh
+connector exec mini 'generate > /tmp/result 2>/tmp/errors'
+connector cp mini:/tmp/result mini:/tmp/errors /workspace/
+```
+
+This cannot recover output already lost to capture overflow. Generic caller
+stdin may already be fully materialized before the call; only its in-flight
+connector transport is bounded. Disk-backed Pipekeep/spool is future work.
+
+Keep `src/flow-control.ts` constants synchronized with Persona's
+`src/connector-provider/flow-control.ts`. Source delivery uses the existing GitHub
+installation path: run `npm test`, `npm run typecheck`, and `npm run build`, and
+commit the rebuilt `dist/` with source. Merge the daemon update before enabling
+Persona's capability requirement. Operators update/restart installations when
+they choose; this change adds no automatic update, npm publish, or release
+workflow. Related to Persona #408.
