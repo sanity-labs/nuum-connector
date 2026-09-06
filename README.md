@@ -398,3 +398,33 @@ Start the connector with an explicit working directory:
 - There is no command sandboxing in this version.
 
 Use a dedicated low-privilege OS user when possible.
+
+## Bounded Persona file transfers
+
+This daemon advertises the `byte-credit-v1` capability for coordinated Persona
+`connector cp` uploads and downloads. A supporting Persona provider/client
+negotiates each transfer before launching it. New Persona rejects transfers
+against old daemons (including the historical in-repo Persona daemon) with an
+explicit upgrade-required error. Ordinary exec and lease/auth commands remain
+compatible; old clients/providers continue their legacy behavior without a new
+bounded-transfer guarantee.
+
+The protocol uses per-command byte credit in both directions: 16 KiB maximum
+decoded data frames, 64 KiB outstanding bytes per direction, and 64 KiB maximum
+serialized transfer frames. Stdout/stderr share output credit; child pipes are
+read only within credit. Stdin credit is returned after child writes complete
+and drain is honored. The provider relays by command ID without pausing the
+shared uplink, so a blocked copy leaves other sessions and control frames usable.
+Exit/error/cancel frames need no data credit. Successful exit follows all output;
+cancellation destroys paused streams and signals the bounded command's process
+group, escalating after five seconds. Node/kernel stream buffers add fixed
+allowances to the credit windows; legacy arbitrary exec output is not bounded by
+this extension.
+
+Keep `src/flow-control.ts` constants synchronized with Persona's
+`src/connector-provider/flow-control.ts`. Source delivery uses the existing GitHub
+installation path: run `npm test`, `npm run typecheck`, and `npm run build`, and
+commit the rebuilt `dist/` with source. Merge the daemon update before enabling
+Persona's capability requirement. Operators update/restart installations when
+they choose; this change adds no automatic update, npm publish, or release
+workflow. Related to Persona #408.

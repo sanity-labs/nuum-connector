@@ -1,3 +1,5 @@
+import type { BOUNDED_TRANSFER } from "./flow-control.js";
+
 /**
  * provider -> daemon
  *
@@ -26,7 +28,9 @@ export type UplinkCommandFrame =
       env?: Record<string, string>;
       spaceId?: string;
       leaseToken?: string;
+      flowControl?: typeof BOUNDED_TRANSFER;
     }
+  | { type: "output_credit"; commandId: string; bytes: number }
   | { type: "stdin"; commandId: string; data: string }
   | { type: "stdin_close"; commandId: string }
   | { type: "cancel"; commandId: string }
@@ -42,8 +46,9 @@ export type UplinkCommandFrame =
 
 /** daemon -> provider */
 export type UplinkResultFrame =
-  | { type: "ready" }
-  | { type: "started"; commandId: string }
+  | { type: "ready"; capabilities?: string[] }
+  | { type: "started"; commandId: string; flowControl?: typeof BOUNDED_TRANSFER }
+  | { type: "stdin_credit"; commandId: string; bytes: number }
   | { type: "stdout"; commandId: string; data: string }
   | { type: "stderr"; commandId: string; data: string }
   | { type: "exit"; commandId: string; code: number }

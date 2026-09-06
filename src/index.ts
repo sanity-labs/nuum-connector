@@ -16,6 +16,8 @@ import { hostname } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import WebSocket from "ws";
 import type { UplinkCommandFrame, UplinkResultFrame } from "./protocol.js";
+import { CommandFlow } from "./command-flow.js";
+import { BOUNDED_TRANSFER, TRANSFER_WIRE_BYTES } from "./flow-control.js";
 import { LeaseAuthority } from "./auth.js";
 import { parseNotifyConfig, createNtfyNotifier } from "./ntfy.js";
 import {
@@ -68,6 +70,9 @@ const SIGKILL_DELAY = 5_000;
 interface RunningCommand {
   child: ChildProcess;
   killed: boolean;
+  flow?: CommandFlow;
+  cancelFlow?: () => void;
+  failFlow?: (error: Error) => void;
 }
 
 const running = new Map<string, RunningCommand>();
@@ -89,73 +94,96 @@ function startCommand(
   cmd: string[],
   cwd: string,
   env: Record<string, string> | undefined,
+  flowControl?: unknown,
 ): void {
   if (running.has(commandId)) return; // duplicate start
+  if (flowControl !== undefined && flowControl !== BOUNDED_TRANSFER) {
+    safeSend(ws, { type: "error", commandId, code: "unsupported_flow_control", message: "unsupported transfer flow control" });
+    return;
+  }
+  const bounded = flowControl === BOUNDED_TRANSFER;
   const command = cmd.join(" ");
   console.log(`[cmd:${commandId}] ${command}`);
 
   const child = spawn("/bin/sh", ["-c", command], {
     cwd,
+    detached: bounded, // bounded cancellation reaches the transfer shell and its children
     env: env ? { ...process.env, ...env } : process.env,
   });
   const entry: RunningCommand = { child, killed: false };
   running.set(commandId, entry);
 
-  safeSend(ws, { type: "started", commandId });
+  let terminal = false;
+  const finish = (frame: UplinkResultFrame): void => {
+    if (terminal) return;
+    terminal = true;
+    running.delete(commandId);
+    entry.flow?.dispose();
+    safeSend(ws, frame);
+  };
+  const failFlow = (error: Error, code = "transfer_error"): void => {
+    if (terminal) return;
+    terminateCommand(entry, "SIGINT");
+    finish({ type: "error", commandId, code, message: error.message });
+  };
 
-  function onChunk(stream: "stdout" | "stderr", data: Buffer): void {
-    safeSend(ws, { type: stream, commandId, data: data.toString("base64") });
+  if (bounded) {
+    entry.flow = new CommandFlow(child.stdout!, child.stderr!, child.stdin!,
+      (frame) => {
+        if (!safeSend(ws, { ...frame, commandId })) failFlow(new Error("connector uplink closed"));
+      }, failFlow);
+    entry.failFlow = failFlow;
+    entry.cancelFlow = () => failFlow(new Error("connector transfer cancelled"), "cancelled");
   }
-
-  child.stdout?.on("data", (d: Buffer) => onChunk("stdout", d));
-  child.stderr?.on("data", (d: Buffer) => onChunk("stderr", d));
-
-  child.on("close", (code: number | null) => {
-    running.delete(commandId);
-    safeSend(ws, { type: "exit", commandId, code: code ?? 1 });
-  });
-
-  child.on("error", (err: Error) => {
-    running.delete(commandId);
-    safeSend(ws, { type: "error", commandId, code: "spawn_error", message: err.message });
-  });
+  safeSend(ws, { type: "started", commandId, ...(bounded ? { flowControl: BOUNDED_TRANSFER } : {}) });
+  if (entry.flow) entry.flow.start();
+  else {
+    child.stdout?.on("data", (data: Buffer) => safeSend(ws, { type: "stdout", commandId, data: data.toString("base64") }));
+    child.stderr?.on("data", (data: Buffer) => safeSend(ws, { type: "stderr", commandId, data: data.toString("base64") }));
+  }
+  // close waits for the output pipes to finish: exit never overtakes file bytes.
+  child.on("close", (code: number | null) => finish({ type: "exit", commandId, code: code ?? 1 }));
+  child.on("error", (err: Error) => finish({ type: "error", commandId, code: "spawn_error", message: err.message }));
 }
 
 function writeStdin(commandId: string, dataBase64: string): void {
   const entry = running.get(commandId);
   if (!entry?.child.stdin) return;
+  if (entry.flow) { entry.flow.writeInput(dataBase64); return; }
   try { entry.child.stdin.write(Buffer.from(dataBase64, "base64")); } catch { /* closed */ }
 }
 
 function closeStdin(commandId: string): void {
   const entry = running.get(commandId);
   if (!entry?.child.stdin) return;
+  if (entry.flow) { entry.flow.closeInput(); return; }
   try { entry.child.stdin.end(); } catch { /* closed */ }
 }
 
-/** The Ctrl-C path: deliver SIGINT, escalate to SIGKILL if it lingers. */
-function cancelCommand(commandId: string): void {
-  const entry = running.get(commandId);
-  if (!entry || entry.killed) return;
+/** Preserve legacy signals; bounded commands own a process group and paused pipes. */
+function terminateCommand(entry: RunningCommand, signal: NodeJS.Signals): void {
+  if (entry.killed) return;
   entry.killed = true;
-  try { entry.child.kill("SIGINT"); } catch { /* gone */ }
-  setTimeout(() => { try { entry.child.kill("SIGKILL"); } catch { /* gone */ } }, SIGKILL_DELAY);
+  const kill = (sig: NodeJS.Signals): void => {
+    try {
+      if (entry.flow && entry.child.pid) process.kill(-entry.child.pid, sig);
+      else entry.child.kill(sig);
+    } catch { /* gone */ }
+  };
+  kill(signal);
+  entry.flow?.dispose();
+  setTimeout(() => kill("SIGKILL"), SIGKILL_DELAY).unref();
 }
 
-/**
- * Reap every running command. Called when the uplink drops: the provider has
- * already failed all exec sessions, so in-flight output has nowhere to go and
- * the commands are orphaned. Killing + clearing here stops the orphans and
- * prevents a post-reconnect commandId collision.
- */
+function cancelCommand(commandId: string): void {
+  const entry = running.get(commandId);
+  if (!entry) return;
+  if (entry.cancelFlow) entry.cancelFlow();
+  else terminateCommand(entry, "SIGINT");
+}
+
 function reapAllCommands(): void {
-  for (const entry of running.values()) {
-    if (entry.killed) continue;
-    entry.killed = true;
-    const child = entry.child;
-    try { child.kill("SIGTERM"); } catch { /* gone */ }
-    setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* gone */ } }, SIGKILL_DELAY);
-  }
+  for (const entry of running.values()) terminateCommand(entry, "SIGTERM");
   running.clear();
 }
 
@@ -250,17 +278,23 @@ function connect(config: ConnectConfig, cwd: string, authority: LeaseAuthority |
       console.log("Connected. Ready for commands.");
       lastPong = Date.now();
       backoff = 1000;
-      safeSend(ws, { type: "ready" });
+      safeSend(ws, { type: "ready", capabilities: [BOUNDED_TRANSFER] });
     };
 
     ws.onmessage = (event: WebSocket.MessageEvent) => {
       let frame: any;
+      const raw = typeof event.data === "string" ? event.data : event.data.toString();
       try {
-        frame = JSON.parse(typeof event.data === "string" ? event.data : event.data.toString());
+        frame = JSON.parse(raw);
       } catch {
         return;
       }
       if (!frame || typeof frame.type !== "string") return;
+      const active = typeof frame.commandId === "string" ? running.get(frame.commandId) : undefined;
+      if (active?.flow && Buffer.byteLength(raw) > TRANSFER_WIRE_BYTES) {
+        active.failFlow?.(new Error("oversized transfer frame"));
+        return;
+      }
 
       switch (frame.type) {
         case "pong":
@@ -287,7 +321,11 @@ function connect(config: ConnectConfig, cwd: string, authority: LeaseAuthority |
               return;
             }
           }
-          startCommand(ws!, frame.commandId, frame.cmd, frame.cwd || cwd, frame.env);
+          if (frame.flowControl !== undefined && Buffer.byteLength(JSON.stringify(frame)) > TRANSFER_WIRE_BYTES) {
+            safeSend(ws, { type: "error", commandId: frame.commandId, code: "transfer_error", message: "oversized transfer start" });
+            return;
+          }
+          startCommand(ws!, frame.commandId, frame.cmd, frame.cwd || cwd, frame.env, frame.flowControl);
           return;
         }
         case "renew": {
@@ -336,6 +374,9 @@ function connect(config: ConnectConfig, cwd: string, authority: LeaseAuthority |
           handleAuth(ws!, authority, frame.commandId, frame.spaceId, frame.leaseToken, frame.otp);
           return;
         }
+        case "output_credit":
+          if (typeof frame.commandId === "string") running.get(frame.commandId)?.flow?.grantOutput(frame.bytes);
+          return;
         case "stdin":
           if (typeof frame.commandId === "string" && typeof frame.data === "string") {
             writeStdin(frame.commandId, frame.data);
