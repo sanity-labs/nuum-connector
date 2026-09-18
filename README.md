@@ -24,8 +24,8 @@ The package also exposes a `nuum` binary after install.
 ## Concepts
 
 - **Slug**: the local name for this connector, for example `gpu-box`, `basement-server`, or `laptop`.
-- **Key**: a generated pairing/routing secret. The connector stores it in `~/.nuum/<slug>.json`.
-- **Persona-side registration**: the paired space must run `connector set <slug> <key>` once.
+- **Connector ID**: the generated identifier used to register and route to this connector. The connector stores it in `~/.nuum/<slug>.json`. Treat the file as private operational config, but the ID is not the main access-control boundary.
+- **Persona-side registration**: the paired space must run `connector set <slug> <connector-id>` once.
 - **Lease auth**: optional OTP approval layer. When enabled, shell exec fails closed until a human approves a lease. Leases are time-boxed by default; the operator's `--max-lease` policy decides whether agents may request longer or indefinite leases.
 
 ## Quickstart without OTP auth
@@ -37,10 +37,10 @@ npx -y github:sanity-labs/nuum-connector my-host \
   --url https://persona.example.com
 ```
 
-On first run it prints a generated key. In Persona, register it:
+On first run it prints a generated Connector ID. In Persona, register it:
 
 ```sh
-connector set my-host <key-printed-by-the-connector>
+connector set my-host <connector-id-printed-by-the-connector>
 ```
 
 Then agents can run commands:
@@ -88,10 +88,10 @@ npx -y github:sanity-labs/nuum-connector my-host \
   --cwd "$HOME"
 ```
 
-On first run, register the printed key in Persona:
+On first run, register the printed Connector ID in Persona:
 
 ```sh
-connector set my-host <key-printed-by-the-connector>
+connector set my-host <connector-id-printed-by-the-connector>
 ```
 
 Now unauthenticated exec attempts fail closed:
@@ -204,9 +204,9 @@ The connector stores configuration at:
 ~/.nuum/<slug>.json
 ```
 
-The file contains the slug, URL, and connector key, and should be mode `0600`.
+The file contains the slug, URL, and Connector ID, and should be mode `0600`.
 
-Preserve this file to preserve connector identity. If you delete it, the connector generates a new key and Persona must run `connector set <slug> <new-key>` again.
+Preserve this file to preserve connector identity. If you delete it, the connector generates a new Connector ID and Persona must run `connector set <slug> <new-connector-id>` again.
 
 If you are migrating from older Persona connector builds, the old config may be under:
 
@@ -341,7 +341,7 @@ Check the connector logs and verify:
 
 - `--url` points at the correct Persona/Nuum server.
 - The machine can reach that URL over HTTPS.
-- Persona registered the same key printed/stored by this connector.
+- Persona registered the same Connector ID printed/stored by this connector.
 - You preserved `~/.nuum/<slug>.json` if migrating an existing connector.
 
 ### `Connector '<slug>' requires authorization`
@@ -386,7 +386,7 @@ Start the connector with an explicit working directory:
 ## Security model in this version
 
 - The connector dials outbound; no inbound port is required.
-- Pairing uses the connector key stored in `~/.nuum/<slug>.json`.
+- Routing uses the Connector ID stored in `~/.nuum/<slug>.json`; when OTP auth is enabled, OTP approval grants the time-limited lease that authorizes shell exec.
 - OTP lease auth is opt-in.
 - With OTP auth enabled, exec fails closed without an active lease.
 - OTP approval grants a lease for shell exec from the paired Persona space. The lease duration is fixed by the connector's `--lease`/`--max-lease` policy and shown in the approval message; requests above the maximum are rejected, never shortened.
