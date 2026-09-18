@@ -554,7 +554,7 @@ function main() {
 
   if (config) {
     if (url) config.url = url;
-    console.log(`Nuum connector '${slug}' using stored key: ${config.key}`);
+    console.log(`Nuum connector '${slug}' using stored Connector ID: ${config.key}`);
   } else {
     if (!url) {
       console.error("First run requires --url. Usage: nuum <slug> --url <server-url>");
@@ -564,7 +564,7 @@ function main() {
     config = { slug, url, key };
     saveConfig(config);
     console.log(`New nuum connector '${slug}' created.`);
-    console.log(`Key: ${key}`);
+    console.log(`Connector ID: ${key}`);
     console.log(`\nRun on the Persona side: connector set ${slug} ${key}`);
     console.log("");
   }
